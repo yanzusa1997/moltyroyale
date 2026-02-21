@@ -3,4 +3,4 @@ python-dotenv==1.0.0
 pydantic==2.5.0
 tenacity==8.2.3
 loguru==0.7.2
-schedule==1.2.0
+flask==3.0.0  # Untuk healthcheck
