@@ -1,12 +1,14 @@
 import time
 import random
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+import json
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
 from loguru import logger
-import schedule
+import os
+import sys
 
-from api_client import APIClient, MaintenanceError
-from models import AgentState, GameState, ActionType
+from api_client import APIClient, MaintenanceError, APIError
+from models import AgentState
 from strategy import CombatEvaluator, ItemManager, DeathZoneAvoider, TerrainPriority
 
 class MoltyAgent:
@@ -22,43 +24,118 @@ class MoltyAgent:
         self.last_action_time = None
         self.consecutive_errors = 0
         self.in_maintenance = False
+        self.account_file = "account_data.json"
         
+    def load_saved_account(self) -> bool:
+        """Load saved account data if exists"""
+        try:
+            if os.path.exists(self.account_file):
+                with open(self.account_file, 'r') as f:
+                    data = json.load(f)
+                    self.account_id = data.get('account_id')
+                    self.api_key = data.get('api_key')
+                    
+                    if self.api_key:
+                        self.api_client.api_key = self.api_key
+                        self.api_client.session.headers.update({"X-API-Key": self.api_key})
+                        logger.info(f"Loaded saved account: {self.account_id}")
+                        return True
+        except Exception as e:
+            logger.warning(f"Failed to load saved account: {e}")
+        
+        return False
+    
+    def save_account_data(self, account_data: Dict[str, Any]):
+        """Save account data to file"""
+        try:
+            data = {
+                'account_id': account_data.get('accountId') or account_data.get('id'),
+                'api_key': account_data.get('apiKey'),
+                'name': account_data.get('name'),
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            with open(self.account_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logger.info(f"Account data saved to {self.account_file}")
+            
+            # Also save plain text for easy access
+            with open('api_key.txt', 'w') as f:
+                f.write(f"API Key: {data['api_key']}\n")
+                f.write(f"Account ID: {data['account_id']}\n")
+                if 'verificationCode' in account_data:
+                    f.write(f"Verification Code: {account_data['verificationCode']}\n")
+                    
+        except Exception as e:
+            logger.error(f"Failed to save account data: {e}")
+    
     def setup(self):
         """Initial setup: create account and get API key"""
         try:
-            # Step 1: Create account
+            # Try to load saved account first
+            if self.load_saved_account():
+                logger.info("Using saved account")
+                return True
+            
+            # Create new account
             logger.info("Creating new account...")
             result = self.api_client.create_account(self.agent_name)
             
-            if result.get('success'):
-                account_data = result['data']
-                self.account_id = account_data['accountId']
-                self.api_key = account_data['apiKey']
+            logger.debug(f"Account creation result: {result}")
+            
+            # Check different response structures
+            if isinstance(result, dict):
+                # Try different possible response structures
+                account_data = None
                 
-                # Save API key to file (CRITICAL!)
-                with open('api_key.txt', 'w') as f:
-                    f.write(f"API Key: {self.api_key}\n")
-                    f.write(f"Account ID: {self.account_id}\n")
-                    f.write(f"Verification Code: {account_data['verificationCode']}\n")
+                if result.get('success') and 'data' in result:
+                    account_data = result['data']
+                elif 'data' in result:
+                    account_data = result['data']
+                elif 'accountId' in result or 'id' in result:
+                    account_data = result
                 
-                logger.success(f"Account created! API Key saved to api_key.txt")
-                logger.info(f"Verification Code: {account_data['verificationCode']}")
+                if account_data:
+                    self.account_id = account_data.get('accountId') or account_data.get('id')
+                    self.api_key = account_data.get('apiKey')
+                    
+                    if self.api_key:
+                        # Save account data
+                        self.save_account_data(account_data)
+                        
+                        # Update API client with key
+                        self.api_client.api_key = self.api_key
+                        self.api_client.session.headers.update({"X-API-Key": self.api_key})
+                        
+                        logger.success(f"Account created! ID: {self.account_id}")
+                        
+                        # Try to get account info to verify
+                        try:
+                            info = self.api_client.get_account_info()
+                            logger.info(f"Account verified: {info}")
+                        except:
+                            pass
+                        
+                        return True
                 
-                # Update API client with key
-                self.api_client.api_key = self.api_key
-                self.api_client.session.headers.update({"X-API-Key": self.api_key})
-                
-                return True
+                logger.error(f"Unexpected response structure: {result}")
+                return False
             else:
-                logger.error("Failed to create account")
+                logger.error(f"Unexpected response type: {type(result)}")
                 return False
                 
         except MaintenanceError:
             self.in_maintenance = True
             logger.warning("Server under maintenance, cannot setup")
             return False
+        except APIError as e:
+            logger.error(f"API Error during setup: {e}")
+            return False
         except Exception as e:
             logger.error(f"Setup failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def find_or_create_game(self):
@@ -67,20 +144,48 @@ class MoltyAgent:
             # Try to find waiting game
             games = self.api_client.get_waiting_games()
             
-            if games.get('success') and games.get('data'):
-                # Join first available game
-                self.game_id = games['data'][0]['id']
-                logger.info(f"Joined existing game: {self.game_id}")
-                return True
+            logger.debug(f"Games response: {games}")
+            
+            if games and isinstance(games, dict):
+                # Try different response structures
+                games_list = None
+                
+                if games.get('success') and 'data' in games:
+                    games_list = games['data']
+                elif 'data' in games:
+                    games_list = games['data']
+                elif isinstance(games, list):
+                    games_list = games
+                
+                if games_list and len(games_list) > 0:
+                    # Join first available game
+                    first_game = games_list[0]
+                    self.game_id = first_game.get('id')
+                    if self.game_id:
+                        logger.info(f"Joined existing game: {self.game_id}")
+                        return True
             
             # Create new game
             logger.info("No waiting games, creating new...")
             new_game = self.api_client.create_game()
             
-            if new_game.get('success'):
-                self.game_id = new_game['data']['id']
-                logger.info(f"Created new game: {self.game_id}")
-                return True
+            logger.debug(f"Create game response: {new_game}")
+            
+            if new_game and isinstance(new_game, dict):
+                game_data = None
+                
+                if new_game.get('success') and 'data' in new_game:
+                    game_data = new_game['data']
+                elif 'data' in new_game:
+                    game_data = new_game['data']
+                elif 'id' in new_game:
+                    game_data = new_game
+                
+                if game_data:
+                    self.game_id = game_data.get('id')
+                    if self.game_id:
+                        logger.info(f"Created new game: {self.game_id}")
+                        return True
             
             return False
             
@@ -95,17 +200,33 @@ class MoltyAgent:
     def register(self):
         """Register agent in game"""
         try:
+            if not self.api_key:
+                logger.error("No API key available")
+                return False
+            
             result = self.api_client.register_agent(self.game_id, f"{self.agent_name}_AI")
             
-            if result.get('success'):
-                agent_data = result['data']
-                self.agent_id = agent_data['id']
-                logger.success(f"Agent registered! ID: {self.agent_id}")
-                logger.info(f"Initial stats: HP={agent_data['hp']}, EP={agent_data['ep']}")
-                return True
-            else:
-                logger.error(f"Registration failed: {result}")
-                return False
+            logger.debug(f"Register response: {result}")
+            
+            if result and isinstance(result, dict):
+                agent_data = None
+                
+                if result.get('success') and 'data' in result:
+                    agent_data = result['data']
+                elif 'data' in result:
+                    agent_data = result['data']
+                elif 'id' in result:
+                    agent_data = result
+                
+                if agent_data:
+                    self.agent_id = agent_data.get('id')
+                    if self.agent_id:
+                        logger.success(f"Agent registered! ID: {self.agent_id}")
+                        logger.info(f"Initial stats: HP={agent_data.get('hp', '?')}, EP={agent_data.get('ep', '?')}")
+                        return True
+            
+            logger.error(f"Registration failed: {result}")
+            return False
                 
         except MaintenanceError:
             self.in_maintenance = True
@@ -122,10 +243,23 @@ class MoltyAgent:
         
         state = self.api_client.get_agent_state(self.game_id, self.agent_id)
         
-        if state and state.get('success'):
-            self.current_state = AgentState(**state['data'])
-            self.consecutive_errors = 0
-            return state['data']
+        if state and isinstance(state, dict):
+            # Extract data from response
+            state_data = None
+            if state.get('success') and 'data' in state:
+                state_data = state['data']
+            elif 'data' in state:
+                state_data = state['data']
+            else:
+                state_data = state
+            
+            if state_data:
+                self.current_state = AgentState(**state_data)
+                self.consecutive_errors = 0
+                return state_data
+            else:
+                self.consecutive_errors += 1
+                return None
         else:
             self.consecutive_errors += 1
             return None
@@ -134,109 +268,74 @@ class MoltyAgent:
         """Core AI decision making"""
         
         # Parse state into objects
-        agent = AgentState(**state)
+        try:
+            agent = AgentState(**state)
+        except Exception as e:
+            logger.error(f"Failed to parse agent state: {e}")
+            return {"action": "rest"}  # Default action
         
-        # Priority 1: Check for death zone
-        current_region = state.get('regions', {}).get(agent.regionId, {})
-        if DeathZoneAvoider.is_in_death_zone(current_region):
-            logger.warning("IN DEATH ZONE! MUST MOVE!")
-            # Find safe direction
-            adjacent = state.get('adjacentRegions', [])
-            safe_dir = DeathZoneAvoider.find_safe_direction(current_region, adjacent)
-            if safe_dir:
-                return {"action": ActionType.MOVE, "target": safe_dir}
+        # Priority 1: Check if we're alive
+        if not agent.isAlive:
+            logger.error("Agent is dead!")
+            return {"action": "rest"}
         
-        # Priority 2: Check health
+        # Priority 2: Check for death zone (simplified for now)
+        # Since we don't have full region data, we'll be cautious
+        
+        # Priority 3: Check health
         if ItemManager.need_healing(agent):
-            healing_item = ItemManager.get_best_healing_item(agent.inventory)
+            healing_item = ItemManager.get_best_healing_item([i.dict() for i in agent.inventory])
             if healing_item:
-                logger.info(f"Using healing item: {healing_item.get('name')}")
+                logger.info(f"Using healing item")
                 return {
-                    "action": ActionType.USE_ITEM,
-                    "target": healing_item['id'],
-                    "data": {"targetId": healing_item['id']}
+                    "action": "useItem",
+                    "target": healing_item['id']
                 }
         
-        # Priority 3: Check for threats in same region
-        units_in_region = [u for u in state.get('units', []) 
-                          if u.get('position') == agent.regionId 
-                          and u.get('id') != agent.id]
+        # Priority 4: Check for threats in same region
+        units_in_region = state.get('units', [])
         
         if units_in_region:
-            # Evaluate each threat
-            for unit in units_in_region:
-                should_attack, reason = CombatEvaluator.should_attack(agent, unit)
-                if should_attack:
-                    logger.info(f"Attacking {unit.get('name')}: {reason}")
-                    return {"action": ActionType.ATTACK, "target": unit['id']}
+            # Filter out self
+            other_units = [u for u in units_in_region if u.get('id') != agent.id]
             
-            # Check if we should flee
-            if CombatEvaluator.should_flee(agent, units_in_region):
-                logger.warning("Too many threats, fleeing!")
-                # Move to random adjacent region
-                adjacent = state.get('adjacentRegions', [])
-                if adjacent:
-                    safe_dir = random.choice([a['direction'] for a in adjacent if a])
-                    return {"action": ActionType.MOVE, "target": safe_dir}
+            for unit in other_units:
+                # Check if it's a monster (simplified)
+                if unit.get('type') == 'monster' or unit.get('name') in ['Wolf', 'Bear', 'Bandit']:
+                    if agent.ep >= 2:
+                        logger.info(f"Attacking monster: {unit.get('name')}")
+                        return {"action": "attack", "target": unit['id']}
         
-        # Priority 4: Check for items
-        items_in_region = [i for i in state.get('items', []) 
-                          if i.get('regionId') == agent.regionId]
+        # Priority 5: Check for items
+        items_in_region = state.get('items', [])
         
         if items_in_region and len(agent.inventory) < 10:
-            # Pick up best item
-            valuable_items = sorted(items_in_region, 
-                                   key=lambda i: i.get('value', 0), reverse=True)
-            if valuable_items:
-                logger.info(f"Picking up item: {valuable_items[0].get('name')}")
-                return {"action": ActionType.PICKUP, "target": valuable_items[0]['id']}
+            # Pick up first item
+            first_item = items_in_region[0]
+            logger.info(f"Picking up item")
+            return {"action": "pickup", "target": first_item['id']}
         
-        # Priority 5: Equip better weapon
-        if agent.equippedWeapon is None:
-            best_weapon = ItemManager.get_best_weapon(agent.inventory)
-            if best_weapon:
-                logger.info(f"Equipping weapon: {best_weapon.get('name')}")
-                return {"action": ActionType.EQUIP, "target": best_weapon['id']}
-        
-        # Priority 6: Explore or move strategically
+        # Priority 6: Explore or move
         if agent.ep >= 1:
-            # Check if we should rest to recover EP
-            if agent.ep < 3:  # Low EP
+            # Check if we should rest
+            if agent.ep < 3:
                 logger.info("Resting to recover EP")
-                return {"action": ActionType.REST}
+                return {"action": "rest"}
             
-            # Explore current region for items
-            if random.random() < 0.3:  # 30% chance to explore
+            # Explore current region
+            if random.random() < 0.5:
                 logger.info("Exploring current region")
-                return {"action": ActionType.EXPLORE}
+                return {"action": "explore"}
             
-            # Move to better region
-            adjacent = state.get('adjacentRegions', [])
-            if adjacent:
-                # Score each adjacent region
-                best_region = None
-                best_score = -1
-                
-                for adj in adjacent:
-                    if adj:  # Not None (blocked)
-                        terrain = adj.get('terrain', 'plains')
-                        score = TerrainPriority.get_score(terrain)
-                        
-                        # Bonus for unexplored
-                        if adj.get('explored') == False:
-                            score += 20
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_region = adj['direction']
-                
-                if best_region:
-                    logger.info(f"Moving to strategic region (score: {best_score})")
-                    return {"action": ActionType.MOVE, "target": best_region}
+            # Move to random direction
+            directions = ['north', 'northeast', 'southeast', 'south', 'southwest', 'northwest']
+            direction = random.choice(directions)
+            logger.info(f"Moving {direction}")
+            return {"action": "move", "target": direction}
         
-        # Default: rest if nothing else to do
-        logger.info("No strategic action, resting")
-        return {"action": ActionType.REST}
+        # Default: rest
+        logger.info("No action, resting")
+        return {"action": "rest"}
     
     def execute_action(self, action: Dict[str, Any]):
         """Execute decided action"""
@@ -251,19 +350,24 @@ class MoltyAgent:
             action.get('data')
         )
         
-        if result and result.get('success'):
-            self.last_action_time = datetime.now()
-            logger.info(f"Action {action['action']} successful")
-            return True
+        if result and isinstance(result, dict):
+            # Check if action was successful
+            if result.get('success') or 'data' in result:
+                self.last_action_time = datetime.now(timezone.utc)
+                logger.info(f"Action {action['action']} successful")
+                return True
+            else:
+                logger.error(f"Action failed: {result}")
+                return False
         else:
-            logger.error(f"Action failed: {result}")
+            logger.error(f"Action failed: invalid response")
             return False
     
     def check_maintenance_window(self) -> bool:
         """Check if we're in maintenance window (09:30-10:30 UTC)"""
-        now = datetime.utcnow()
-        maintenance_start = now.replace(hour=9, minute=30, second=0)
-        maintenance_end = now.replace(hour=10, minute=30, second=0)
+        now = datetime.now(timezone.utc)
+        maintenance_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        maintenance_end = now.replace(hour=10, minute=30, second=0, microsecond=0)
         
         if now >= maintenance_start and now <= maintenance_end:
             if not self.in_maintenance:
@@ -294,16 +398,19 @@ class MoltyAgent:
                     if self.consecutive_errors > 5:
                         logger.error("Too many consecutive errors, restarting...")
                         break
+                    logger.warning(f"No state received, waiting... (error {self.consecutive_errors}/5)")
                     time.sleep(30)
                     continue
                 
                 # Check if game is running
-                if state.get('status') != 'running':
-                    if state.get('status') == 'finished':
+                game_status = state.get('status', 'unknown')
+                
+                if game_status != 'running':
+                    if game_status == 'finished':
                         logger.success(f"Game finished! Kills: {state.get('kills', 0)}")
                         break
                     
-                    logger.info(f"Game status: {state.get('status')}, waiting...")
+                    logger.info(f"Game status: {game_status}, waiting...")
                     time.sleep(30)
                     continue
                 
@@ -313,17 +420,16 @@ class MoltyAgent:
                     break
                 
                 # Log current status
-                logger.info(f"Status: HP={state['hp']}/{state['maxHp']}, "
-                           f"EP={state['ep']}/{state['maxEp']}, "
+                logger.info(f"Status: HP={state.get('hp', '?')}/{state.get('maxHp', '?')}, "
+                           f"EP={state.get('ep', '?')}/{state.get('maxEp', '?')}, "
                            f"Kills={state.get('kills', 0)}")
                 
                 # Decide and execute action
                 action = self.decide_action(state)
+                logger.info(f"Decision: {action}")
                 self.execute_action(action)
                 
                 # Wait for next turn (60 seconds real time)
-                # But if we used Rest, we can act again in 0 seconds?
-                # Actually Rest is group 1 action, so still need 60s
                 time.sleep(60)
                 
             except MaintenanceError:
@@ -335,6 +441,8 @@ class MoltyAgent:
                 break
             except Exception as e:
                 logger.error(f"Error in game loop: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(30)
     
     def run(self):
@@ -350,19 +458,20 @@ class MoltyAgent:
         # Setup
         if not self.setup():
             logger.error("Setup failed")
-            return
+            return False
         
         # Find or create game
         if not self.find_or_create_game():
             logger.error("Failed to get game")
-            return
+            return False
         
         # Register agent
         if not self.register():
             logger.error("Failed to register")
-            return
+            return False
         
         # Run main loop
         self.run_game_loop()
         
         logger.info("Agent execution completed")
+        return True
