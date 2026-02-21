@@ -1,9 +1,10 @@
 import requests
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from loguru import logger
 import os
+from datetime import datetime, timezone
 
 BASE_URL = "https://mort-royal-production.up.railway.app/api"
 
@@ -21,14 +22,23 @@ class APIClient:
             self.session.headers.update({"X-API-Key": self.api_key})
     
     def _handle_response(self, response: requests.Response) -> Dict[str, Any]:
+        """Handle API response with proper error checking"""
         if response.status_code == 503:
             raise MaintenanceError("Server under maintenance")
-        elif response.status_code >= 400:
+        
+        # Log response for debugging
+        logger.debug(f"Response {response.status_code}: {response.text[:200]}")
+        
+        if response.status_code >= 400:
             error_msg = f"API Error {response.status_code}: {response.text}"
             logger.error(error_msg)
             raise APIError(error_msg)
         
-        return response.json()
+        try:
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            return {"success": False, "error": "Invalid JSON response"}
     
     @retry(
         stop=stop_after_attempt(3),
@@ -38,11 +48,23 @@ class APIClient:
     def create_account(self, name: str) -> Dict[str, Any]:
         """Step 1: Create account and get API key"""
         logger.info(f"Creating account with name: {name}")
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
         response = self.session.post(
             f"{BASE_URL}/accounts",
-            json={"name": name}
+            json={"name": name},
+            headers=headers
         )
-        return self._handle_response(response)
+        
+        result = self._handle_response(response)
+        
+        # Log full response for debugging
+        logger.debug(f"Create account response: {result}")
+        
+        return result
     
     @retry(
         stop=stop_after_attempt(3),
@@ -78,10 +100,18 @@ class APIClient:
     def register_agent(self, game_id: str, agent_name: str) -> Dict[str, Any]:
         """Register agent in a game"""
         logger.info(f"Registering agent {agent_name} in game {game_id}")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": self.api_key
+        }
+        
         response = self.session.post(
             f"{BASE_URL}/games/{game_id}/agents/register",
-            json={"name": agent_name}
+            json={"name": agent_name},
+            headers=headers
         )
+        
         return self._handle_response(response)
     
     def get_agent_state(self, game_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -103,6 +133,8 @@ class APIClient:
                 payload["target"] = target
             if data:
                 payload.update(data)
+            
+            logger.debug(f"Sending action: {payload}")
             
             response = self.session.post(
                 f"{BASE_URL}/games/{game_id}/agents/{agent_id}/action",
