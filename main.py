@@ -9,7 +9,7 @@ import sys
 import time
 from loguru import logger
 from agent import MoltyAgent
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Configure logging
 logger.remove()  # Remove default handler
@@ -32,20 +32,23 @@ def main():
     
     logger.info("=" * 50)
     logger.info(f"Molty Royale AI Agent - {agent_name}")
-    logger.info(f"Start time: {datetime.utcnow().isoformat()} UTC")
+    logger.info(f"Start time: {datetime.now(timezone.utc).isoformat()} UTC")
     logger.info("=" * 50)
     
     # Create and run agent
     agent = MoltyAgent(agent_name)
     
     try:
-        agent.run()
+        success = agent.run()
+        if success:
+            logger.info("Agent finished successfully")
+            return 0
+        else:
+            logger.error("Agent failed")
+            return 1
     except Exception as e:
         logger.exception(f"Fatal error: {e}")
         return 1
-    
-    logger.info("Agent finished successfully")
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
